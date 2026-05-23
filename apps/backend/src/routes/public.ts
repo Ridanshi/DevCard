@@ -1,5 +1,8 @@
-import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
+import type { FastifyContextConfig, FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 import { generateQRBuffer, generateQRSvg } from '../utils/qr.js';
+import type { PlatformLink } from '@devcard/shared';
+import { getErrorMessage } from '../utils/error.util.js';
+
 
 // ── QR size bounds ────────────────────────────────────────────────────────────
 // Enforced before any DB query or image allocation.  Values outside this range
@@ -7,7 +10,6 @@ import { generateQRBuffer, generateQRSvg } from '../utils/qr.js';
 // unbounded memory allocation in the QR rasteriser.
 const MIN_QR_SIZE = 1;
 const MAX_QR_SIZE = 2048;
-
 type PublicProfileLink = {
   id: string;
   platform: string;
@@ -65,6 +67,12 @@ type UsernameCardPublicProfileResponse = {
   links: PublicProfileCardLink[]
 }
 
+// Represents a CardLink record with the joined PlatformLink relation
+interface CardLinkWithPlatform {
+  id: string;
+  displayOrder: number;
+  platformLink: PlatformLink;
+}
 
 
 export async function publicRoutes(app: FastifyInstance) {
@@ -75,13 +83,8 @@ export async function publicRoutes(app: FastifyInstance) {
         max: 100,
         timeWindow: '1 minute'
       }
-    }
-  }, async (request: FastifyRequest<{ Params: { username: string } }>, reply: FastifyReply) => {
-  /**
-   * GET /api/public/:username
-   * Returns the public profile information for a user.
-  */
-  app.get('/:username', async (request: FastifyRequest<{ Params: { username: string } }>, reply: FastifyReply) => {
+    } as FastifyContextConfig
+  }, async (request: FastifyRequest<{ Params: { username: string }; Querystring: { source?: string } }>, reply: FastifyReply) => {
     const { username } = request.params;
 
     const user = await app.prisma.user.findUnique({
@@ -98,13 +101,15 @@ export async function publicRoutes(app: FastifyInstance) {
     }
 
     // Try to extract viewer from Authorization header (soft auth)
-    let viewerId = null;
+    let viewerId: string | null = null;
     try {
       if (request.headers.authorization) {
-        const decoded = await request.jwtVerify() as any;
-        viewerId = decoded?.id || null;
+        const decoded = (await request.jwtVerify()) as { id?: string };
+        viewerId = decoded?.id ?? null;
+      } else {
+        viewerId = null; // Unauthenticated viewer
       }
-    } catch (e) {
+    } catch {
       // Ignored if invalid token
     }
 
@@ -118,9 +123,9 @@ export async function publicRoutes(app: FastifyInstance) {
           viewerId,
           viewerIp: request.ip || null,
           viewerAgent: request.headers['user-agent'] || null,
-          source: (request.query as any)?.source || 'link',
+          source: request.query?.source || 'link',
         },
-      }).catch(err => app.log.error('Failed to log view:', err));
+      }).catch((err: unknown) => app.log.error(`Failed to log view: ${getErrorMessage(err)}`));
     }
 
     // Fetch viewer's successful follow logs for this profile's links
@@ -130,21 +135,25 @@ export async function publicRoutes(app: FastifyInstance) {
         where: {
           followerId: viewerId,
           status: 'success',
-          OR: user.platformLinks.map(link => ({
+          OR: user.platformLinks.map((link: PlatformLink) => ({
             platform: link.platform,
             targetUsername: link.username,
           })),
         },
+        select: {
+          platform: true,
+          targetUsername: true,
+        },
       });
 
       followedLinkIds = user.platformLinks
-        .filter(link =>
-          successfulFollows.some(f =>
+        .filter((link: PlatformLink) =>
+          successfulFollows.some((f: { platform: string; targetUsername: string }) =>
             f.platform === link.platform &&
             f.targetUsername.toLowerCase() === link.username.toLowerCase()
           )
         )
-        .map(link => link.id);
+        .map((link: PlatformLink) => link.id);
     }
 
     const response: UsernamePublicProfileResponse = {
@@ -156,7 +165,7 @@ export async function publicRoutes(app: FastifyInstance) {
       company: user.company,
       avatarUrl: user.avatarUrl,
       accentColor: user.accentColor,
-      links: user.platformLinks.map((link) => ({
+      links: user.platformLinks.map((link: PlatformLink) => ({
         id: link.id,
         platform: link.platform,
         username: link.username,
@@ -183,7 +192,7 @@ export async function publicRoutes(app: FastifyInstance) {
         max: 100,
         timeWindow: '1 minute'
       }
-    }
+    } as FastifyContextConfig
   }, async (request: FastifyRequest<{ Params: { cardId: string } }>, reply: FastifyReply) => {
     const { cardId } = request.params;
 
@@ -212,7 +221,7 @@ export async function publicRoutes(app: FastifyInstance) {
         avatarUrl: card.user.avatarUrl,
         accentColor: card.user.accentColor,
       },
-      links: card.cardLinks.map((cl) => ({
+      links: card.cardLinks.map((cl: CardLinkWithPlatform) => ({
         id: cl.platformLink.id,
         platform: cl.platformLink.platform,
         username: cl.platformLink.username,
@@ -231,14 +240,13 @@ export async function publicRoutes(app: FastifyInstance) {
         max: 100,
         timeWindow: '1 minute'
       }
-    }
-  }, async (request: FastifyRequest<{ Params: { username: string; cardId: string } }>, reply: FastifyReply) => {
-  /**
-   * GET /api/public/:username/card/:cardId
-   * Returns full owner profile + specific card data.
-   * Used when viewing a card through username + cardId (e.g. QR code scans).
-  */
-  app.get('/:username/card/:cardId', async (request: FastifyRequest<{ Params: { username: string; cardId: string } }>, reply: FastifyReply) => {
+    } as FastifyContextConfig
+  }, async (request: FastifyRequest<{ Params: { username: string; cardId: string }; Querystring: { source?: string } }>, reply: FastifyReply) => {
+    /**
+     * GET /api/public/:username/card/:cardId
+     * Returns full owner profile + specific card data.
+     * Used when viewing a card through username + cardId (e.g. QR code scans).
+    */
     const { username, cardId } = request.params;
 
     const user = await app.prisma.user.findUnique({
@@ -263,17 +271,17 @@ export async function publicRoutes(app: FastifyInstance) {
       return reply.status(404).send({ error: 'Card not found' });
     }
 
-    let viewerId = null;
+    let viewerId: string | null = null;
     try {
       if (request.headers.authorization) {
-        const decoded = await request.jwtVerify() as any;
-        if (decoded?.id !== user.id) {
-          viewerId = decoded.id;
-        }
+        const decoded = (await request.jwtVerify()) as { id?: string };
+        viewerId = decoded?.id ?? null;
       }
-    } catch (e) {}
+    } catch {
+      // Ignored if invalid token
+    }
 
-    if (viewerId !== user.id) {
+    if (viewerId && viewerId !== user.id) {
       app.prisma.cardView.create({
         data: {
           ownerId: user.id,
@@ -281,9 +289,9 @@ export async function publicRoutes(app: FastifyInstance) {
           viewerId,
           viewerIp: request.ip || null,
           viewerAgent: request.headers['user-agent'] || null,
-          source: (request.query as any)?.source || 'qr',
+          source: request.query?.source || 'qr',
         },
-      }).catch(err => app.log.error('Failed to log card view:', err));
+      }).catch((err: unknown) => app.log.error(`Failed to log view: ${getErrorMessage(err)}`));
     }
 
 
@@ -299,7 +307,7 @@ export async function publicRoutes(app: FastifyInstance) {
         avatarUrl: user.avatarUrl,
         accentColor: user.accentColor,
       },
-      links: card.cardLinks.map((cl) => ({
+      links: card.cardLinks.map((cl: CardLinkWithPlatform) => ({
         id: cl.platformLink.id,
         platform: cl.platformLink.platform,
         username: cl.platformLink.username,
@@ -318,7 +326,7 @@ export async function publicRoutes(app: FastifyInstance) {
         max: 50, // Lower limit for QR generation as it's more resource intensive
         timeWindow: '1 minute'
       }
-    }
+    } as FastifyContextConfig
   }, async (request: FastifyRequest<{
     Params: { username: string };
     Querystring: { format?: string; size?: string };
