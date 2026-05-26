@@ -1,6 +1,7 @@
-import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { Prisma } from '@prisma/client';
 import { createEventSchema } from '../validations/event.validation.js';
+
+import type { Prisma } from '@prisma/client';
+import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 
 // ── Response types ────────────────────────────────────────────────────────────
 
@@ -63,13 +64,21 @@ type EventWithAttendees = Prisma.EventGetPayload<{
 
 type AccessResult = 'allowed' | 'unauthenticated' | 'forbidden';
 
+type EventAccessSubject = {
+  id: string;
+  isPublic: boolean;
+  organizerId: string;
+};
+
 /**
  * Extracts the authenticated user ID from the Bearer JWT when present.
  * Returns null for unauthenticated requests or invalid/expired tokens.
  * Never throws — safe to call on any request regardless of auth state.
  */
 async function getRequestUserId(request: FastifyRequest): Promise<string | null> {
-  if (!request.headers.authorization) return null;
+  if (!request.headers.authorization) {
+    return null;
+  }
   try {
     const decoded = (await request.jwtVerify()) as { id: string };
     return decoded?.id ?? null;
@@ -90,12 +99,18 @@ async function getRequestUserId(request: FastifyRequest): Promise<string | null>
  */
 async function canAccessEvent(
   app: FastifyInstance,
-  event: { id: string; isPublic: boolean; organizerId: string },
+  event: EventAccessSubject,
   userId: string | null,
 ): Promise<AccessResult> {
-  if (event.isPublic) return 'allowed';
-  if (!userId) return 'unauthenticated';
-  if (userId === event.organizerId) return 'allowed';
+  if (event.isPublic) {
+    return 'allowed';
+  }
+  if (!userId) {
+    return 'unauthenticated';
+  }
+  if (userId === event.organizerId) {
+    return 'allowed';
+  }
 
   const membership = await app.prisma.eventAttendee.findUnique({
     where: { userId_eventId: { userId, eventId: event.id } },
@@ -123,14 +138,11 @@ export async function eventRoutes(app: FastifyInstance) {
     }>,
     reply: FastifyReply,
   ) => {
-    let decoded: { id: string };
-    try {
-      decoded = (await request.jwtVerify()) as { id: string };
-    } catch {
+    const userId = await getRequestUserId(request);
+    if (!userId) {
       return reply.status(401).send({ error: 'Unauthorized' });
     }
 
-    const userId = decoded.id;
     const parsed = createEventSchema.safeParse(request.body);
 
     if (!parsed.success) {
@@ -141,7 +153,7 @@ export async function eventRoutes(app: FastifyInstance) {
 
     // Derive a URL-safe slug from the event name and ensure it is unique.
     // The loop retries with a short random suffix on collision.
-    let cleanSlug = name
+    const cleanSlug = name
       .toLowerCase()
       .trim()
       .replace(/\s+/g, '-')
@@ -152,7 +164,9 @@ export async function eventRoutes(app: FastifyInstance) {
 
     while (true) {
       const existing = await app.prisma.event.findUnique({ where: { slug: finalSlug } });
-      if (!existing) break;
+      if (!existing) {
+        break;
+      }
       const randomSuffix = Math.random().toString(36).substring(2, 6);
       finalSlug = `${cleanSlug}-${randomSuffix}`;
     }
@@ -171,7 +185,7 @@ export async function eventRoutes(app: FastifyInstance) {
         },
       });
       return reply.status(201).send(newEvent);
-    } catch (error) {
+    } catch (_error) {
       app.log.error('Failed to create event');
       return reply.status(500).send({ error: 'Failed to create event' });
     }
@@ -228,19 +242,19 @@ export async function eventRoutes(app: FastifyInstance) {
     request: FastifyRequest<{ Params: { slug: string } }>,
     reply: FastifyReply,
   ) => {
-    let decoded: { id: string };
-    try {
-      decoded = (await request.jwtVerify()) as { id: string };
-    } catch {
+    const userId = await getRequestUserId(request);
+    if (!userId) {
       return reply.status(401).send({ error: 'Unauthorized' });
     }
 
-    const userId = decoded.id;
     const { slug } = request.params;
 
     const event = await app.prisma.event.findUnique({ where: { slug } });
     if (!event) {
       return reply.status(404).send({ error: 'Event not found' });
+    }
+    if (event.endDate < new Date()) {
+      return reply.status(400).send({ error: 'Cannot join an event that has already ended' });
     }
 
     try {
@@ -263,14 +277,11 @@ export async function eventRoutes(app: FastifyInstance) {
     request: FastifyRequest<{ Params: { slug: string } }>,
     reply: FastifyReply,
   ) => {
-    let decoded: { id: string };
-    try {
-      decoded = (await request.jwtVerify()) as { id: string };
-    } catch {
+    const userId = await getRequestUserId(request);
+    if (!userId) {
       return reply.status(401).send({ error: 'Unauthorized' });
     }
 
-    const userId = decoded.id;
     const { slug } = request.params;
 
     const event = await app.prisma.event.findUnique({ where: { slug } });

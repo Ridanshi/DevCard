@@ -1,7 +1,9 @@
+import Fastify, { type FastifyInstance } from 'fastify';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import Fastify, { FastifyInstance } from 'fastify';
-import { PrismaClient } from '@prisma/client';
+
 import { eventRoutes } from '../routes/event.js';
+
+import type { PrismaClient } from '@prisma/client';
 
 // ── Shared mock data ──────────────────────────────────────────────────────────
 
@@ -15,8 +17,8 @@ const MOCK_EVENT = {
   description: 'Annual DevCard conference',
   location: 'San Francisco, CA',
   organizerId: MOCK_USER_ID,
-  startDate: new Date('2025-09-01T09:00:00Z'),
-  endDate: new Date('2025-09-02T18:00:00Z'),
+  startDate: new Date('2999-09-01T09:00:00Z'),
+  endDate: new Date('2999-09-02T18:00:00Z'),
   isPublic: true,
   createdAt: new Date('2025-01-01T00:00:00Z'),
 };
@@ -72,7 +74,7 @@ const prismaMock = {
 //
 // Routes are registered under /api/events to match the production prefix.
 
-let mockJwtVerify = vi.fn();
+const mockJwtVerify = vi.fn();
 
 async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({ logger: false });
@@ -437,6 +439,25 @@ describe('Events API', () => {
 
       expect(res.statusCode).toBe(404);
       expect(res.json()).toMatchObject({ error: 'Event not found' });
+    });
+
+    it('400 — rejects joining an event that has already ended', async () => {
+      prismaMock.event.findUnique.mockResolvedValue({
+        ...MOCK_EVENT,
+        endDate: new Date('2000-01-01T00:00:00Z'),
+      });
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/events/devcard-conf-2025/join',
+        headers: authHeader(),
+      });
+
+      expect(res.statusCode).toBe(400);
+      expect(res.json()).toMatchObject({
+        error: 'Cannot join an event that has already ended',
+      });
+      expect(prismaMock.eventAttendee.create).not.toHaveBeenCalled();
     });
 
     it('409 — returns 409 when user has already joined', async () => {
