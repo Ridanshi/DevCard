@@ -8,6 +8,7 @@ const GITHUB_USER_URL = 'https://api.github.com/user';
 const GOOGLE_AUTH_URL = 'https://accounts.google.com/o/oauth2/v2/auth';
 const GOOGLE_TOKEN_URL = 'https://oauth2.googleapis.com/token';
 const GOOGLE_USER_URL = 'https://www.googleapis.com/oauth2/v2/userinfo';
+const INVALID_MOBILE_REDIRECT_ERROR = 'Invalid mobile redirect URI';
 
 interface OAuthCallbackQuery {
   code: string;
@@ -41,6 +42,9 @@ export async function authRoutes(app: FastifyInstance) {
     const redirectUri = `${process.env.BACKEND_URL}/auth/github/callback`;
     const clientState = (request.query as any).state || '';
     const mobileRedirectUri = (request.query as any).mobile_redirect_uri || '';
+    if (clientState.startsWith('mobile_') && mobileRedirectUri && !isAllowedMobileRedirectUri(mobileRedirectUri)) {
+      return reply.status(400).send({ error: INVALID_MOBILE_REDIRECT_ERROR });
+    }
     const state = buildOAuthState(clientState, mobileRedirectUri);
 
   // Store state in a short-lived signed cookie before redirecting
@@ -78,6 +82,10 @@ app.get('/github/callback', async (request: FastifyRequest<{ Querystring: OAuthC
 
   if (!code) {
     return reply.status(400).send({ error: 'Missing authorization code' });
+  }
+  const mobileRedirect = state?.startsWith('mobile_') ? getMobileRedirectUri(state) : null;
+  if (state?.startsWith('mobile_') && !mobileRedirect) {
+    return reply.status(400).send({ error: INVALID_MOBILE_REDIRECT_ERROR });
   }
 
     try {
@@ -165,7 +173,6 @@ app.get('/github/callback', async (request: FastifyRequest<{ Querystring: OAuthC
 
       // For mobile app: redirect with token as URL fragment (not sent to servers, keeps token out of logs)
       if (request.query.state?.startsWith('mobile_')) {
-        const mobileRedirect = getMobileRedirectUri(request.query.state) || process.env.MOBILE_REDIRECT_URI;
         return reply.redirect(`${mobileRedirect}#token=${token}`);
       }
 
@@ -192,6 +199,9 @@ app.get('/github/callback', async (request: FastifyRequest<{ Querystring: OAuthC
     const redirectUri = `${process.env.BACKEND_URL}/auth/google/callback`;
     const clientState = (request.query as any).state || '';
     const mobileRedirectUri = (request.query as any).mobile_redirect_uri || '';
+    if (clientState.startsWith('mobile_') && mobileRedirectUri && !isAllowedMobileRedirectUri(mobileRedirectUri)) {
+      return reply.status(400).send({ error: INVALID_MOBILE_REDIRECT_ERROR });
+    }
     const state = buildOAuthState(clientState, mobileRedirectUri);
 
   // Store state in a short-lived signed cookie before redirecting
@@ -230,6 +240,10 @@ app.get('/github/callback', async (request: FastifyRequest<{ Querystring: OAuthC
 
   if (!code) {
     return reply.status(400).send({ error: 'Missing authorization code' });
+  }
+  const mobileRedirect = state?.startsWith('mobile_') ? getMobileRedirectUri(state) : null;
+  if (state?.startsWith('mobile_') && !mobileRedirect) {
+    return reply.status(400).send({ error: INVALID_MOBILE_REDIRECT_ERROR });
   }
 
     try {
@@ -287,7 +301,6 @@ app.get('/github/callback', async (request: FastifyRequest<{ Querystring: OAuthC
       );
 
       if (request.query.state?.startsWith('mobile_')) {
-        const mobileRedirect = getMobileRedirectUri(request.query.state) || process.env.MOBILE_REDIRECT_URI;
         return reply.redirect(`${mobileRedirect}#token=${token}`);
       }
 
@@ -375,14 +388,41 @@ function getMobileRedirectUri(state?: string): string | null {
     return null;
   }
 
-  const encodedRedirect = state.split('.')[1];
-  if (!encodedRedirect) {
-    return null;
+  const stateParts = state.split('.');
+  const encodedRedirect = stateParts[1];
+  if (stateParts.length < 3 || !encodedRedirect) {
+    const configuredRedirect = process.env.MOBILE_REDIRECT_URI;
+    return configuredRedirect && isAllowedMobileRedirectUri(configuredRedirect) ? configuredRedirect : null;
   }
 
   try {
-    return Buffer.from(encodedRedirect, 'base64url').toString('utf8');
+    const redirectUri = Buffer.from(encodedRedirect, 'base64url').toString('utf8');
+    return isAllowedMobileRedirectUri(redirectUri) ? redirectUri : null;
   } catch {
     return null;
+  }
+}
+
+function isAllowedMobileRedirectUri(redirectUri: string): boolean {
+  const configuredRedirect = process.env.MOBILE_REDIRECT_URI;
+  if (!configuredRedirect) {
+    return false;
+  }
+
+  try {
+    const candidate = new URL(redirectUri);
+    const allowed = new URL(configuredRedirect);
+
+    if (candidate.protocol !== allowed.protocol) {
+      return false;
+    }
+
+    if (candidate.protocol === 'http:' || candidate.protocol === 'https:') {
+      return candidate.origin === allowed.origin;
+    }
+
+    return candidate.host === allowed.host;
+  } catch {
+    return false;
   }
 }
