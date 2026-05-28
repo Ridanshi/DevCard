@@ -63,33 +63,18 @@ export async function authRoutes(app: FastifyInstance) {
     const authUrl = `${GITHUB_AUTH_URL}?${params}`;
     return reply.redirect(authUrl);
   });
-  const authUrl = `${GITHUB_AUTH_URL}?${params}`;
-  app.log.debug({ provider: 'github' }, 'OAuth redirect initiated');
-  return reply.redirect(authUrl);
-});
-
-app.get('/github/callback', async (request: FastifyRequest<{ Querystring: OAuthCallbackQuery }>, reply: FastifyReply) => {
-  const { code, state } = request.query;
-
-  // ── CSRF check ──────────────────────────────────────────────────────────────
-  const storedState = (request.cookies as any)?.oauth_state;
-  if (!state || !storedState || state !== storedState) {
-    return reply.status(400).send({ error: 'Invalid or missing OAuth state — possible CSRF attack' });
-  }
-  // Clear the state cookie immediately — prevents replay
-  reply.clearCookie('oauth_state', { path: '/' });
-  // ────────────────────────────────────────────────────────────────────────────
 
   app.get('/github/callback', async (request: FastifyRequest<{ Querystring: OAuthCallbackQuery }>, reply: FastifyReply) => {
     const { code, state } = request.query;
 
-    // Validate state to prevent CSRF attacks
-    const storedState = (request.cookies as any).oauth_state;
-    reply.clearCookie('oauth_state', { path: '/' });
-
-    if (!storedState || !state || state !== storedState) {
-      return reply.status(400).send({ error: 'Invalid OAuth state parameter.' });
+    // ── CSRF check ──────────────────────────────────────────────────────────────
+    const storedState = (request.cookies as any)?.oauth_state;
+    if (!state || !storedState || state !== storedState) {
+      return reply.status(400).send({ error: 'Invalid or missing OAuth state — possible CSRF attack' });
     }
+    // Clear the state cookie immediately — prevents replay
+    reply.clearCookie('oauth_state', { path: '/' });
+    // ────────────────────────────────────────────────────────────────────────────
 
     if (!code) {
       return reply.status(400).send({ error: 'Missing authorization code' });
@@ -233,32 +218,17 @@ app.get('/github/callback', async (request: FastifyRequest<{ Querystring: OAuthC
     const authUrl = `${GOOGLE_AUTH_URL}?${params}`;
     return reply.redirect(authUrl);
   });
-  const authUrl = `${GOOGLE_AUTH_URL}?${params}`;
-  app.log.debug({ provider: 'google' }, 'OAuth redirect initiated');
-  return reply.redirect(authUrl);
-});
-
- app.get('/google/callback', async (request: FastifyRequest<{ Querystring: OAuthCallbackQuery }>, reply: FastifyReply) => {
-  const { code, state } = request.query;
-
-  // ── CSRF check ──────────────────────────────────────────────────────────────
-  const storedState = (request.cookies as any)?.oauth_state;
-  if (!state || !storedState || state !== storedState) {
-    return reply.status(400).send({ error: 'Invalid or missing OAuth state — possible CSRF attack' });
-  }
-  reply.clearCookie('oauth_state', { path: '/' });
-  // ────────────────────────────────────────────────────────────────────────────
 
   app.get('/google/callback', async (request: FastifyRequest<{ Querystring: OAuthCallbackQuery }>, reply: FastifyReply) => {
     const { code, state } = request.query;
 
-    // Validate state to prevent CSRF attacks
-    const storedState = (request.cookies as any).oauth_state;
-    reply.clearCookie('oauth_state', { path: '/' });
-
-    if (!storedState || !state || state !== storedState) {
-      return reply.status(400).send({ error: 'Invalid OAuth state parameter.' });
+    // ── CSRF check ──────────────────────────────────────────────────────────────
+    const storedState = (request.cookies as any)?.oauth_state;
+    if (!state || !storedState || state !== storedState) {
+      return reply.status(400).send({ error: 'Invalid or missing OAuth state — possible CSRF attack' });
     }
+    reply.clearCookie('oauth_state', { path: '/' });
+    // ────────────────────────────────────────────────────────────────────────────
 
     if (!code) {
       return reply.status(400).send({ error: 'Missing authorization code' });
