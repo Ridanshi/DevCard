@@ -104,30 +104,33 @@ export async function cardRoutes(app: FastifyInstance): Promise<void> {
         }
       }
 
-      // Check if user's first card -> make it default.
-      // Prisma wraps the nested cardLinks.create inside card.create in a single
-      // implicit transaction, so either both the card and its links are written or neither is.
-      const cardCount = await app.prisma.card.count({ where: { userId } });
-
-      const card = await app.prisma.card.create({
-        data: {
-          userId,
-          title: parsed.data.title,
-          isDefault: cardCount === 0,
-          cardLinks: {
-            create: parsed.data.linkIds.map((linkId, index) => ({
-              platformLinkId: linkId,
-              displayOrder: index,
-            })),
+      // The count check and card creation run inside a single serializable
+      // transaction so that two concurrent first-card requests cannot both
+      // observe count = 0 and both set isDefault = true. Serializable
+      // isolation causes the database to roll back the second conflicting
+      // transaction rather than allowing both to commit with isDefault = true.
+      const card = await app.prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+        const cardCount = await tx.card.count({ where: { userId } });
+        return tx.card.create({
+          data: {
+            userId,
+            title: parsed.data.title,
+            isDefault: cardCount === 0,
+            cardLinks: {
+              create: parsed.data.linkIds.map((linkId, index) => ({
+                platformLinkId: linkId,
+                displayOrder: index,
+              })),
+            },
           },
-        },
-        include: {
-          cardLinks: {
-            include: { platformLink: true },
-            orderBy: { displayOrder: 'asc' },
+          include: {
+            cardLinks: {
+              include: { platformLink: true },
+              orderBy: { displayOrder: 'asc' },
+            },
           },
-        },
-      });
+        });
+      }, { isolationLevel: 'Serializable' });
 
       const response = {
         id: card.id, 
