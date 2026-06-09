@@ -1,44 +1,70 @@
+import Fastify, { type FastifyInstance } from 'fastify';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import Fastify from 'fastify';
-import jwt from '@fastify/jwt';
+
 import { connectRoutes } from '../routes/connect.js';
+
 import type { PrismaClient } from '@prisma/client';
 
-process.env.PUBLIC_APP_URL = 'http://localhost:3000';
-process.env.BACKEND_URL = 'http://localhost:3001';
-process.env.MOBILE_REDIRECT_URI = 'devcard://connect';
-process.env.GITHUB_CLIENT_ID = 'test-client-id';
-process.env.GITHUB_CLIENT_SECRET = 'test-client-secret';
-process.env.ENCRYPTION_KEY = '12345678901234567890123456789012';
+// ── Shared test helpers ───────────────────────────────────────────────────────
 
-const mockRedis = {
-  get: vi.fn(),
-  set: vi.fn(),
-  del: vi.fn(),
-};
+/** Build a valid base64-encoded state string the way connect.ts does. */
+function makeState(userId: string, nonce: string): string {
+  return Buffer.from(JSON.stringify({ userId, nonce })).toString('base64');
+}
+
+/** Corrupt a valid base64 string so JSON.parse throws. */
+function malformedBase64(): string {
+  return 'not!!valid%%base64';
+}
+
+/** Valid base64 but wrong shape (missing required fields). */
+function missingFieldState(): string {
+  return Buffer.from(JSON.stringify({ bad: 'payload' })).toString('base64');
+}
+
+// ── Module mocks ─────────────────────────────────────────────────────────────
+
+vi.mock('../utils/encryption.js', () => ({
+  encrypt: vi.fn().mockReturnValue('encrypted-test-token'),
+  decrypt: vi.fn().mockReturnValue('plain-test-token'),
+}));
+
+// ── Mock setup ────────────────────────────────────────────────────────────────
+
+const USER_ID = 'user-abc';
+const NONCE   = 'a'.repeat(64); // 32 bytes hex
 
 const mockPrisma = {
   oAuthToken: {
-    findMany: vi.fn(),
-    upsert: vi.fn(),
-    delete: vi.fn(),
+    findMany: vi.fn().mockResolvedValue([]),
+    upsert:   vi.fn().mockResolvedValue({}),
+    delete:   vi.fn().mockResolvedValue({}),
   },
 };
 
-global.fetch = vi.fn();
+// Redis mock: get/set/del are replaced per-test in beforeEach
+const mockRedis = {
+  set: vi.fn(),
+  get: vi.fn(),
+  del: vi.fn(),
+};
 
-async function buildApp() {
-  const app = Fastify();
-  await app.register(jwt, { secret: 'test-secret' });
+// Capture fetch calls so we can assert token exchange never fires for bad state
+const mockFetch = vi.fn();
+
+async function buildApp(): Promise<FastifyInstance> {
+  const app = Fastify({ logger: false });
+
   app.decorate('prisma', mockPrisma as unknown as PrismaClient);
-  app.decorate('redis', mockRedis as any);
-  
-  app.decorate('authenticate', async (request: any, reply: any) => {
-    try {
-      await request.jwtVerify();
-    } catch (err) {
-      reply.status(401).send({ error: 'Unauthorized' });
-    }
+  app.decorate('redis',  mockRedis as any);
+  app.decorate('authenticate', async (request: any) => {
+    request.user = { id: USER_ID };
+  });
+
+  // Expose jwtVerify on request so the route plugin doesn't blow up if it
+  // tries to call it (it doesn't, but some Fastify internals reference it).
+  app.decorateRequest('jwtVerify', async function () {
+    return { id: USER_ID };
   });
 
   app.register(connectRoutes, { prefix: '/api/connect' });
@@ -46,142 +72,253 @@ async function buildApp() {
   return app;
 }
 
-describe('GET /api/connect/github/callback', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
+// Replace global fetch with our mock for every test
+beforeEach(() => {
+  vi.clearAllMocks();
+  (globalThis as any).fetch = mockFetch;
+
+  // Default Redis behaviours (override in individual tests)
+  mockRedis.set.mockResolvedValue('OK');
+  mockRedis.get.mockResolvedValue(null);
+  mockRedis.del.mockResolvedValue(1);
+
+  // Default: GitHub returns a valid access token
+  mockFetch.mockResolvedValue({
+    json: async () => ({ access_token: 'ghs_test_token', scope: 'user:follow' }),
   });
 
-  it('redirects with missing_params if code or state is missing', async () => {
-    const app = await buildApp();
-    
-    // Missing code
-    let res = await app.inject({
-      method: 'GET',
-      url: '/api/connect/github/callback?state=somestate',
-    });
-    expect(res.statusCode).toBe(302);
-    expect(res.headers.location).toBe('http://localhost:3000/settings?error=missing_params');
+  process.env.PUBLIC_APP_URL   = 'http://localhost:5173';
+  process.env.BACKEND_URL      = 'http://localhost:3000';
+  process.env.GITHUB_CLIENT_ID = 'test-client-id';
+});
 
-    // Missing state
-    res = await app.inject({
-      method: 'GET',
-      url: '/api/connect/github/callback?code=somecode',
-    });
+// ── GET /api/connect/github — initiation ─────────────────────────────────────
+
+describe('GET /api/connect/github — nonce initiation', () => {
+  it('persists a nonce in Redis before redirecting', async () => {
+    const app = await buildApp();
+    const res = await app.inject({ method: 'GET', url: '/api/connect/github' });
+
     expect(res.statusCode).toBe(302);
-    expect(res.headers.location).toBe('http://localhost:3000/settings?error=missing_params');
+    expect(mockRedis.set).toHaveBeenCalledOnce();
+
+    const [key, value, ex, ttl] = mockRedis.set.mock.calls[0];
+    expect(key).toMatch(/^oauth:nonce:/);
+    expect(value).toBe(USER_ID);
+    expect(ex).toBe('EX');
+    expect(ttl).toBe(600);
   });
 
-  it('redirects with connect_failed if state is invalid/malformed', async () => {
+  it('embeds the nonce in the state query param', async () => {
     const app = await buildApp();
-    const invalidState = Buffer.from(JSON.stringify({ wrongKey: 'value' })).toString('base64');
-    
+    const res = await app.inject({ method: 'GET', url: '/api/connect/github' });
+
+    const location = res.headers['location'] as string;
+    const url      = new URL(location);
+    const state    = JSON.parse(Buffer.from(url.searchParams.get('state')!, 'base64').toString());
+
+    expect(state.userId).toBe(USER_ID);
+    expect(typeof state.nonce).toBe('string');
+    expect(state.nonce.length).toBeGreaterThan(0);
+
+    // The nonce in the redirect must match what was stored in Redis
+    const storedKey = mockRedis.set.mock.calls[0][0] as string;
+    expect(storedKey).toBe(`oauth:nonce:${state.nonce}`);
+  });
+
+  it('fails closed with 500 when Redis is unavailable', async () => {
+    mockRedis.set.mockRejectedValueOnce(new Error('ECONNREFUSED'));
+
+    const app = await buildApp();
+    const res = await app.inject({ method: 'GET', url: '/api/connect/github' });
+
+    expect(res.statusCode).toBe(500);
+    expect(res.json().error).toBe('Failed to initiate OAuth flow');
+    // No redirect issued — attacker cannot initiate unprotected flow
+    expect(res.headers['location']).toBeUndefined();
+  });
+});
+
+// ── GET /api/connect/github/callback — validation ────────────────────────────
+
+describe('GET /api/connect/github/callback — nonce validation', () => {
+
+  // ── Happy path ─────────────────────────────────────────────────────────────
+
+  it('completes the connect flow for a valid nonce', async () => {
+    mockRedis.get.mockResolvedValue(USER_ID); // nonce exists in Redis
+
+    const app  = await buildApp();
+    const res  = await app.inject({
+      method: 'GET',
+      url:    `/api/connect/github/callback?code=gh_code&state=${makeState(USER_ID, NONCE)}`,
+    });
+
+    expect(res.statusCode).toBe(302);
+    expect(res.headers['location']).toContain('connected=github');
+
+    // Token exchange happened
+    expect(mockFetch).toHaveBeenCalledOnce();
+    // Token was stored
+    expect(mockPrisma.oAuthToken.upsert).toHaveBeenCalledOnce();
+  });
+
+  it('consumes the nonce (deletes from Redis) after a successful flow', async () => {
+    mockRedis.get.mockResolvedValue(USER_ID);
+
+    const app = await buildApp();
+    await app.inject({
+      method: 'GET',
+      url:    `/api/connect/github/callback?code=gh_code&state=${makeState(USER_ID, NONCE)}`,
+    });
+
+    expect(mockRedis.del).toHaveBeenCalledWith(`oauth:nonce:${NONCE}`);
+  });
+
+  // ── Forged / unknown nonce ─────────────────────────────────────────────────
+
+  it('rejects a forged state with an unknown nonce (Redis returns null)', async () => {
+    mockRedis.get.mockResolvedValue(null); // nonce never persisted
+
+    const app = await buildApp();
     const res = await app.inject({
       method: 'GET',
-      url: `/api/connect/github/callback?code=testcode&state=${invalidState}`,
+      url:    `/api/connect/github/callback?code=gh_code&state=${makeState(USER_ID, 'forged-nonce')}`,
     });
-    
+
     expect(res.statusCode).toBe(302);
-    expect(res.headers.location).toBe('http://localhost:3000/settings?error=connect_failed');
-  });
+    expect(res.headers['location']).toContain('error=connect_failed');
 
-  it('redirects with invalid_state if nonce is not found in Redis (CSRF/Expired)', async () => {
-    mockRedis.get.mockResolvedValue(null);
-    const app = await buildApp();
-    const validState = Buffer.from(JSON.stringify({ userId: 'user-1', nonce: 'nonce-123' })).toString('base64');
-    
-    const res = await app.inject({
-      method: 'GET',
-      url: `/api/connect/github/callback?code=testcode&state=${validState}`,
-    });
-    
-    expect(mockRedis.get).toHaveBeenCalledWith('oauth:nonce:nonce-123');
-    expect(res.statusCode).toBe(302);
-    expect(res.headers.location).toBe('http://localhost:3000/settings?error=invalid_state');
-  });
-
-  it('redirects with invalid_state if Redis userId does not match state userId', async () => {
-    mockRedis.get.mockResolvedValue('different-user-id');
-    const app = await buildApp();
-    const validState = Buffer.from(JSON.stringify({ userId: 'user-1', nonce: 'nonce-123' })).toString('base64');
-    
-    const res = await app.inject({
-      method: 'GET',
-      url: `/api/connect/github/callback?code=testcode&state=${validState}`,
-    });
-    
-    expect(res.statusCode).toBe(302);
-    expect(res.headers.location).toBe('http://localhost:3000/settings?error=invalid_state');
-  });
-
-  it('successfully exchanges code, upserts token, and redirects on valid flow (Web)', async () => {
-    mockRedis.get.mockResolvedValue('user-1');
-    (global.fetch as any).mockResolvedValue({
-      json: vi.fn().mockResolvedValue({ access_token: 'github-access-token', scope: 'user:follow' })
-    });
-    mockPrisma.oAuthToken.upsert.mockResolvedValue({});
-
-    const app = await buildApp();
-    const validState = Buffer.from(JSON.stringify({ userId: 'user-1', nonce: 'web_nonce-123' })).toString('base64');
-    
-    const res = await app.inject({
-      method: 'GET',
-      url: `/api/connect/github/callback?code=testcode&state=${validState}`,
-    });
-    
-    // Nonce should be deleted immediately
-    expect(mockRedis.del).toHaveBeenCalledWith('oauth:nonce:web_nonce-123');
-    
-    // Code exchange should be triggered
-    expect(global.fetch).toHaveBeenCalledWith('https://github.com/login/oauth/access_token', expect.objectContaining({
-      method: 'POST',
-      body: expect.stringContaining('testcode')
-    }));
-
-    // Upsert should be called
-    expect(mockPrisma.oAuthToken.upsert).toHaveBeenCalledWith(expect.objectContaining({
-      where: { userId_platform: { userId: 'user-1', platform: 'github_follow' } }
-    }));
-
-    // Redirects to web success
-    expect(res.statusCode).toBe(302);
-    expect(res.headers.location).toBe('http://localhost:3000/settings?connected=github');
-  });
-
-  it('redirects to mobile scheme if nonce starts with mobile_', async () => {
-    mockRedis.get.mockResolvedValue('user-1');
-    (global.fetch as any).mockResolvedValue({
-      json: vi.fn().mockResolvedValue({ access_token: 'github-access-token', scope: 'user:follow' })
-    });
-    mockPrisma.oAuthToken.upsert.mockResolvedValue({});
-
-    const app = await buildApp();
-    const validState = Buffer.from(JSON.stringify({ userId: 'user-1', nonce: 'mobile_nonce-123' })).toString('base64');
-    
-    const res = await app.inject({
-      method: 'GET',
-      url: `/api/connect/github/callback?code=testcode&state=${validState}`,
-    });
-    
-    expect(res.statusCode).toBe(302);
-    expect(res.headers.location).toBe('devcard://connect?connected=github');
-  });
-
-  it('redirects with connect_failed if token exchange returns an error', async () => {
-    mockRedis.get.mockResolvedValue('user-1');
-    (global.fetch as any).mockResolvedValue({
-      json: vi.fn().mockResolvedValue({ error: 'bad_verification_code' })
-    });
-
-    const app = await buildApp();
-    const validState = Buffer.from(JSON.stringify({ userId: 'user-1', nonce: 'nonce-123' })).toString('base64');
-    
-    const res = await app.inject({
-      method: 'GET',
-      url: `/api/connect/github/callback?code=testcode&state=${validState}`,
-    });
-    
+    // Token exchange must NOT fire for an unvalidated state
+    expect(mockFetch).not.toHaveBeenCalled();
     expect(mockPrisma.oAuthToken.upsert).not.toHaveBeenCalled();
+  });
+
+  // ── Replay attack ──────────────────────────────────────────────────────────
+
+  it('blocks a replay of a previously consumed nonce', async () => {
+    // First request: valid nonce is consumed
+    mockRedis.get
+      .mockResolvedValueOnce(USER_ID) // first call succeeds
+      .mockResolvedValueOnce(null);    // second call: nonce gone
+
+    const app   = await buildApp();
+    const state = makeState(USER_ID, NONCE);
+
+    const first  = await app.inject({ method: 'GET', url: `/api/connect/github/callback?code=code1&state=${state}` });
+    const second = await app.inject({ method: 'GET', url: `/api/connect/github/callback?code=code2&state=${state}` });
+
+    expect(first.statusCode).toBe(302);
+    expect(first.headers['location']).toContain('connected=github');
+
+    expect(second.statusCode).toBe(302);
+    expect(second.headers['location']).toContain('error=connect_failed');
+
+    // Fetch only fired for the first (valid) request
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  // ── userId mismatch ────────────────────────────────────────────────────────
+
+  it('rejects a state where userId does not match the stored nonce owner', async () => {
+    // Nonce was issued for USER_ID; attacker claims it belongs to another user
+    mockRedis.get.mockResolvedValue(USER_ID);
+
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'GET',
+      url:    `/api/connect/github/callback?code=gh_code&state=${makeState('attacker-user-id', NONCE)}`,
+    });
+
     expect(res.statusCode).toBe(302);
-    expect(res.headers.location).toBe('http://localhost:3000/settings?error=connect_failed');
+    expect(res.headers['location']).toContain('error=connect_failed');
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  // ── Malformed inputs ───────────────────────────────────────────────────────
+
+  it('rejects malformed base64 state gracefully', async () => {
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'GET',
+      url:    `/api/connect/github/callback?code=gh_code&state=${malformedBase64()}`,
+    });
+
+    expect(res.statusCode).toBe(302);
+    expect(res.headers['location']).toContain('error=connect_failed');
+    expect(mockRedis.get).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects valid base64 with a missing-field JSON payload', async () => {
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'GET',
+      url:    `/api/connect/github/callback?code=gh_code&state=${missingFieldState()}`,
+    });
+
+    expect(res.statusCode).toBe(302);
+    expect(res.headers['location']).toContain('error=connect_failed');
+    expect(mockRedis.get).not.toHaveBeenCalled();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects requests with no state parameter', async () => {
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'GET',
+      url:    '/api/connect/github/callback?code=gh_code',
+    });
+
+    expect(res.statusCode).toBe(302);
+    expect(res.headers['location']).toContain('error=missing_params');
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('rejects requests with no code parameter', async () => {
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'GET',
+      url:    `/api/connect/github/callback?state=${makeState(USER_ID, NONCE)}`,
+    });
+
+    expect(res.statusCode).toBe(302);
+    expect(res.headers['location']).toContain('error=missing_params');
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  // ── Redis failures ─────────────────────────────────────────────────────────
+
+  it('fails closed when Redis throws during nonce lookup', async () => {
+    mockRedis.get.mockRejectedValueOnce(new Error('Redis connection lost'));
+
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'GET',
+      url:    `/api/connect/github/callback?code=gh_code&state=${makeState(USER_ID, NONCE)}`,
+    });
+
+    expect(res.statusCode).toBe(302);
+    expect(res.headers['location']).toContain('error=server_error');
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  // ── Token exchange error ───────────────────────────────────────────────────
+
+  it('redirects with connect_failed when GitHub rejects the code', async () => {
+    mockRedis.get.mockResolvedValue(USER_ID);
+    mockFetch.mockResolvedValueOnce({
+      json: async () => ({ error: 'bad_verification_code' }),
+    });
+
+    const app = await buildApp();
+    const res = await app.inject({
+      method: 'GET',
+      url:    `/api/connect/github/callback?code=bad_code&state=${makeState(USER_ID, NONCE)}`,
+    });
+
+    expect(res.statusCode).toBe(302);
+    expect(res.headers['location']).toContain('error=connect_failed');
+    expect(mockPrisma.oAuthToken.upsert).not.toHaveBeenCalled();
   });
 });

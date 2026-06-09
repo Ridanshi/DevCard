@@ -1,6 +1,8 @@
-import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
-import { randomBytes } from 'crypto';
+import { randomBytes } from 'node:crypto';
+
 import { encrypt } from '../utils/encryption.js';
+
+import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify';
 
 const GITHUB_AUTH_URL = 'https://github.com/login/oauth/authorize';
 const GITHUB_TOKEN_URL = 'https://github.com/login/oauth/access_token';
@@ -8,9 +10,12 @@ const GITHUB_TOKEN_URL = 'https://github.com/login/oauth/access_token';
 // Follow-capable tokens are stored under a dedicated platform key so that
 // the authentication flow (read:user user:email scope, key = 'github') and
 // the connect flow (user:follow scope, key = 'github_follow') never share
-// the same OAuthToken record.  Whichever flow runs last can no longer
-// silently overwrite the other's access token.
+// the same OAuthToken record.
 const GITHUB_FOLLOW_PLATFORM = 'github_follow';
+
+// Nonce TTL: 10 minutes — generous for a login round-trip, short enough to
+// limit the window a leaked state URL could be abused.
+const OAUTH_NONCE_TTL_SECONDS = 600;
 
 interface OAuthCallbackQuery {
   code: string;
@@ -26,13 +31,8 @@ export async function connectRoutes(app: FastifyInstance) {
   // ─── Status ───
 
   app.get('/status', {
-    preHandler: [async (request, reply) => {
-      const server = request.server as any;
-      if (typeof server?.authenticate === 'function') { await server.authenticate(request, reply); return }
-      if (typeof (app as any).authenticate === 'function') { await (app as any).authenticate(request, reply); return }
-      try { await request.jwtVerify() } catch (e) { reply.status(401).send({ error: 'Unauthorized' }) }
-    }],
-  }, async (request: FastifyRequest, reply: FastifyReply) => {
+    preHandler: [(req, rep) => app.authenticate(req, rep)],
+  }, async (request: FastifyRequest, _reply: FastifyReply) => {
     const userId = (request.user as any).id;
 
     const tokens = await app.prisma.oAuthToken.findMany({
@@ -46,39 +46,42 @@ export async function connectRoutes(app: FastifyInstance) {
   // ─── GitHub Connect ───
 
   app.get('/github', {
-    preHandler: [async (request, reply) => {
-      const server = request.server as any;
-      if (typeof server?.authenticate === 'function') { await server.authenticate(request, reply); return }
-      if (typeof (app as any).authenticate === 'function') { await (app as any).authenticate(request, reply); return }
-      try { await request.jwtVerify() } catch (e) { reply.status(401).send({ error: 'Unauthorized' }) }
-    }],
+    preHandler: [(req, rep) => app.authenticate(req, rep)],
   }, async (request: FastifyRequest, reply: FastifyReply) => {
     const userId = (request.user as any).id;
-    const nonce = generateState();
+    const nonce = generateNonce();
 
-    // Store nonce in Redis with 10-minute TTL.
-    // The callback verifies this to prevent CSRF attacks.
-    await app.redis.set(
-      `oauth:nonce:${nonce}`,
-      userId,
-      'EX',
-      600
-    );
+    // Persist the nonce server-side before issuing the redirect.
+    // Fail closed: if Redis is unavailable we must not issue the redirect —
+    // a missing nonce store would leave the callback with no way to validate state.
+    try {
+      await app.redis.set(
+        `oauth:nonce:${nonce}`,
+        userId,
+        'EX',
+        OAUTH_NONCE_TTL_SECONDS,
+      );
+    } catch (err) {
+      app.log.error({ err }, 'Failed to persist OAuth nonce — aborting connect flow');
+      return reply.status(500).send({ error: 'Failed to initiate OAuth flow' });
+    }
 
-    const state = JSON.stringify({ userId, nonce });
-
+    const state = Buffer.from(JSON.stringify({ userId, nonce })).toString('base64');
     const redirectUri = `${process.env.BACKEND_URL}/api/connect/github/callback`;
     const params = new URLSearchParams({
-      client_id: process.env.GITHUB_CLIENT_ID || '',
+      client_id: process.env.GITHUB_CLIENT_ID ?? '',
       redirect_uri: redirectUri,
       scope: 'user:follow',
-      state: Buffer.from(state).toString('base64'),
+      state,
     });
 
     return reply.redirect(`${GITHUB_AUTH_URL}?${params}`);
   });
 
-  app.get('/github/callback', async (request: FastifyRequest<{ Querystring: OAuthCallbackQuery }>, reply: FastifyReply) => {
+  app.get('/github/callback', async (
+    request: FastifyRequest<{ Querystring: OAuthCallbackQuery }>,
+    reply: FastifyReply,
+  ) => {
     const { code, state } = request.query;
 
     if (!code || !state) {
@@ -86,27 +89,49 @@ export async function connectRoutes(app: FastifyInstance) {
     }
 
     try {
-      // Decode state to find which user requested the connect
+      // ── Step 1: parse state ────────────────────────────────────────────────
       const decodedState = parseOAuthState(state);
-
       if (!decodedState) {
+        app.log.warn('OAuth callback received malformed or unparseable state payload');
         return reply.redirect(`${process.env.PUBLIC_APP_URL}/settings?error=connect_failed`);
       }
 
-      // Verify nonce was issued by this server -- prevents CSRF
-      const storedUserId = app.redis ? await app.redis.get(`oauth:nonce:${decodedState.nonce}`) : null;
-
-      if (app.redis && (!storedUserId || storedUserId !== decodedState.userId)) {
-        app.log.warn({ nonce: decodedState.nonce }, 'OAuth CSRF check failed: nonce mismatch');
-        return reply.redirect(`${process.env.PUBLIC_APP_URL}/settings?error=invalid_state`);
+      // ── Step 2: validate nonce server-side ────────────────────────────────
+      // Any failure — unknown nonce, expired nonce, replay, userId mismatch,
+      // or Redis error — fails closed: callback is rejected, no token exchanged.
+      //
+      // The nonce is deleted BEFORE the token exchange so that a mid-flight
+      // error cannot leave a reusable nonce in the store.
+      let storedUserId: string | null;
+      try {
+        const nonceKey = `oauth:nonce:${decodedState.nonce}`;
+        storedUserId = await app.redis.get(nonceKey);
+        if (storedUserId !== null) {
+          // Consume immediately — one-time use regardless of what follows.
+          await app.redis.del(nonceKey);
+        }
+      } catch (err) {
+        app.log.error({ err }, 'Redis error during OAuth nonce lookup — aborting callback');
+        return reply.redirect(`${process.env.PUBLIC_APP_URL}/settings?error=server_error`);
       }
 
-      // Consume the nonce -- one-time use only (if redis configured)
-      if (app.redis) await app.redis.del(`oauth:nonce:${decodedState.nonce}`);
+      if (storedUserId === null) {
+        // Nonce unknown or already expired/consumed — replay or forged request.
+        app.log.warn('OAuth callback nonce not found in Redis — possible replay or forged state');
+        return reply.redirect(`${process.env.PUBLIC_APP_URL}/settings?error=connect_failed`);
+      }
 
-      const userId = decodedState.userId;
+      if (storedUserId !== decodedState.userId) {
+        // Nonce exists but was issued for a different user — state was tampered.
+        app.log.warn('OAuth nonce userId mismatch — state payload does not match issuing session');
+        return reply.redirect(`${process.env.PUBLIC_APP_URL}/settings?error=connect_failed`);
+      }
 
-      // Exchange code for token
+      // Use the Redis-sourced userId as authoritative.
+      // The userId from the client-controlled state parameter is never trusted.
+      const userId = storedUserId;
+
+      // ── Step 3: exchange code for token ───────────────────────────────────
       const tokenRes = await fetch(GITHUB_TOKEN_URL, {
         method: 'POST',
         headers: {
@@ -124,13 +149,13 @@ export async function connectRoutes(app: FastifyInstance) {
       const tokenData = (await tokenRes.json()) as any;
 
       if (tokenData.error) {
-        app.log.error('GitHub connect token error:', tokenData);
+        app.log.error('GitHub token exchange failed during connect flow');
         return reply.redirect(`${process.env.PUBLIC_APP_URL}/settings?error=connect_failed`);
       }
 
-      // Encrypt and store the token under the dedicated follow-scope key so
-      // that a subsequent login (which writes to 'github') cannot overwrite
-      // this follow-capable credential.
+      // ── Step 4: persist encrypted token ───────────────────────────────────
+      // Store under the dedicated follow-scope key so that a subsequent login
+      // (which writes to 'github') cannot overwrite this follow-capable credential.
       const encryptedToken = encrypt(tokenData.access_token);
 
       await app.prisma.oAuthToken.upsert({
@@ -142,27 +167,26 @@ export async function connectRoutes(app: FastifyInstance) {
         },
         update: {
           accessToken: encryptedToken,
-          scopes: tokenData.scope || 'user:follow',
+          scopes: tokenData.scope ?? 'user:follow',
         },
         create: {
           userId,
           platform: GITHUB_FOLLOW_PLATFORM,
           accessToken: encryptedToken,
-          scopes: tokenData.scope || 'user:follow',
+          scopes: tokenData.scope ?? 'user:follow',
         },
       });
 
-      // Redirect back to app settings
-      // If mobile, use custom scheme
+      // ── Step 5: redirect back to the originating client ───────────────────
       if (decodedState.nonce.startsWith('mobile_')) {
-        return reply.redirect(`${process.env.MOBILE_REDIRECT_URI}?connected=github`);
+        return reply.redirect(`${process.env.MOBILE_REDIRECT_URI ?? 'devcard://connect'}?connected=github`);
       }
 
       return reply.redirect(`${process.env.PUBLIC_APP_URL}/settings?connected=github`);
 
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      app.log.error({ error, message }, 'GitHub connect error');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      app.log.error({ err, message }, 'GitHub connect error');
       return reply.redirect(`${process.env.PUBLIC_APP_URL}/settings?error=server_error`);
     }
   });
@@ -171,12 +195,7 @@ export async function connectRoutes(app: FastifyInstance) {
   // ─── Disconnect ───
 
   app.delete('/:platform', {
-    preHandler: [async (request, reply) => {
-      const server = request.server as any;
-      if (typeof server?.authenticate === 'function') { await server.authenticate(request, reply); return }
-      if (typeof (app as any).authenticate === 'function') { await (app as any).authenticate(request, reply); return }
-      try { await request.jwtVerify() } catch (e) { reply.status(401).send({ error: 'Unauthorized' }) }
-    }],
+    preHandler: [(req, rep) => app.authenticate(req, rep)],
   }, async (request: FastifyRequest<{ Params: { platform: string } }>, reply: FastifyReply) => {
     const userId = (request.user as any).id;
     const { platform } = request.params;
@@ -196,7 +215,7 @@ export async function connectRoutes(app: FastifyInstance) {
         },
       });
       return { success: true };
-    } catch (error) {
+    } catch {
       return reply.status(404).send({ error: 'Connection not found' });
     }
   });
@@ -206,16 +225,18 @@ function parseOAuthState(state: string): ParsedOAuthState | null {
   try {
     const decoded = JSON.parse(Buffer.from(state, 'base64').toString('utf-8'));
 
-    // validating the OAuth state structure which is expected
-    if (typeof decoded.userId !== "string" || typeof decoded.nonce !== "string") {
+    if (typeof decoded !== 'object' || decoded === null) {
       return null;
     }
-    return decoded;
+    if (typeof decoded.userId !== 'string' || typeof decoded.nonce !== 'string') {
+      return null;
+    }
+    return decoded as ParsedOAuthState;
   } catch {
     return null;
   }
 }
 
-function generateState(): string {
+function generateNonce(): string {
   return randomBytes(32).toString('hex');
 }
